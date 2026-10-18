@@ -167,7 +167,8 @@
   }
   function applyBg() {
     if (window.WP && typeof WP.apply === 'function') {
-      try { WP.apply(route.name === 'folder' ? route.id : null); } catch (e) {}
+      // folders use their own wallpaper, the home screen uses the one set in Settings, the All view stays plain
+      try { WP.apply(route.name === 'folder' ? route.id : route.name === 'home' ? 'home' : null); } catch (e) {}
     }
   }
   function refreshViews() {
@@ -483,6 +484,10 @@
       '<label><span>Card and folder opacity: <b id="opVal">' + S.settings.opacity + '%</b></span>' +
       '<input id="opRange" type="range" min="30" max="100" step="5" value="' + S.settings.opacity + '"></label>' +
       '<div class="note">100% is fully solid. Lower values make cards and folders see-through, so the folder wallpaper shows behind them.</div>' +
+      (window.WP && typeof WP.openEditor === 'function'
+        ? '<h3>Home screen wallpaper</h3><div class="note" style="margin-bottom:10px">Shown only on the home screen. Each folder has its own wallpaper, and the All view stays plain.</div>' +
+          '<button class="btn sec wide" type="button" id="stHomeWp" style="margin-top:0">Choose or change wallpaper…</button>'
+        : '') +
       '<h3>Calendar alerts</h3><div class="note" style="margin-bottom:8px">Used when you tap “Add to Calendar” on an assignment. Alerts fire before the due time.</div>' +
       '<div class="chkrow">' + CAL.map(c => '<label><input type="checkbox" data-cal="' + c[0] + '"' + (S.settings.cal.indexOf(c[0]) >= 0 ? ' checked' : '') + '>' + c[1] + ' before</label>').join('') + '</div>' +
       '<h3>Backup</h3><div class="note">Everything is stored on this phone only. Deleting the app erases it, so back up now and then. Wallpapers are not included in backups.</div>' +
@@ -496,6 +501,8 @@
           S.settings.opacity = +e.target.value; $('#opVal').textContent = S.settings.opacity + '%'; applySettings();
         });
         $('#opRange').addEventListener('change', save);
+        const homeWp = $('#stHomeWp');
+        if (homeWp) homeWp.addEventListener('click', () => { closeSheet(); WP.openEditor('home'); });
         document.querySelectorAll('#sheetBody [data-cal]').forEach(c => c.addEventListener('change', () => {
           S.settings.cal = [...document.querySelectorAll('#sheetBody [data-cal]')].filter(x => x.checked).map(x => +x.dataset.cal);
           save();
@@ -566,7 +573,7 @@
     showWarn();
     applySettings();
     renderRoute();
-    if (window.WP && typeof WP.cleanup === 'function') { try { WP.cleanup(S.folders.map(f => f.id)); } catch (e) {} }
+    if (window.WP && typeof WP.cleanup === 'function') { try { WP.cleanup(S.folders.map(f => f.id).concat('home')); } catch (e) {} }
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();

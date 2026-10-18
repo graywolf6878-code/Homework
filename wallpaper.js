@@ -1,11 +1,13 @@
-// Per-folder wallpapers: pick a photo, crop it, dim / blur it for readability.
-// Everything is stored on this phone only (IndexedDB). Requires app.js (window.HW).
+// Wallpapers: pick a photo, crop it (zoom in or out), dim / blur it for readability.
+// Used for each folder and for the home screen (key "home"). Everything is stored on this phone only
+// (IndexedDB). Requires app.js (window.HW).
 (function () {
   'use strict';
   if (!window.HW) return;
 
   const $ = (s, r) => (r || document).querySelector(s);
   const DB_NAME = 'hw_wallpapers', STORE = 'wp';
+  const HOME = 'home';
 
   // ------------------------------------------------------------------ styles
   const css = document.createElement('style');
@@ -24,6 +26,7 @@
   .wpc-btn.pri{background:#6366f1}
   .wpc-stage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;padding:8px 12px}
   .wpc-frame{position:relative;overflow:hidden;border-radius:18px;background:#000;box-shadow:0 0 0 2px rgba(255,255,255,.35);touch-action:none;user-select:none;-webkit-user-select:none}
+  .wpc-frame canvas{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
   .wpc-frame img{position:absolute;left:0;top:0;max-width:none;pointer-events:none;-webkit-user-drag:none;user-select:none}
   .wpc-bottom{padding:10px 24px calc(18px + var(--sab));text-align:center}
   .wpc-hint{font-size:.85rem;color:#9aa8bc;margin-bottom:10px}
@@ -60,7 +63,7 @@
   const dbKeys = () => tx('readonly', s => s.getAllKeys());
 
   // ------------------------------------------------------------------ look (dim / blur / readability)
-  const urls = new Map();   // folderId -> { url, ts }
+  const urls = new Map();   // key -> { url, ts }
   let token = 0, shownFid = null;
 
   const autoDim = bright => Math.round(30 + (bright || 0) * 45);   // darker photos need less dimming
@@ -102,6 +105,7 @@
     try {
       const keys = await dbKeys();
       const ok = new Set(validIds);
+      ok.add(HOME);
       for (const k of keys) {
         if (!ok.has(k)) {
           await dbDel(k);
@@ -154,6 +158,35 @@
     for (let i = 0; i < d.length; i += 4) sum += (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
     return sum / (d.length / 4);
   }
+  function smallCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+
+  // Fills a canvas with a soft, darkened, blurred copy of the photo (used where the photo does not reach the edges).
+  // Works by shrinking the photo and growing it back in steps, so it does not need CanvasRenderingContext2D.filter.
+  function paintBlurFill(g, img, w, h, outW, outH) {
+    const sW = 24, sH = Math.max(8, Math.round(24 * outH / outW));
+    const mid = smallCanvas(sW * 4, sH * 4);
+    const k = Math.max(mid.width / w, mid.height / h);
+    const mg = mid.getContext('2d');
+    mg.imageSmoothingQuality = 'high';
+    mg.drawImage(img, (mid.width - w * k) / 2, (mid.height - h * k) / 2, w * k, h * k);
+    let cur = smallCanvas(sW, sH);
+    const cg = cur.getContext('2d');
+    cg.imageSmoothingQuality = 'high';
+    cg.drawImage(mid, 0, 0, sW, sH);
+    while (cur.width < outW) {
+      const nw = Math.min(outW, cur.width * 3);
+      const nh = Math.max(1, Math.round(cur.height * nw / cur.width));
+      const n = smallCanvas(nw, nh);
+      const ng = n.getContext('2d');
+      ng.imageSmoothingEnabled = true; ng.imageSmoothingQuality = 'high';
+      ng.drawImage(cur, 0, 0, nw, nh);
+      cur = n;
+    }
+    g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+    g.drawImage(cur, 0, 0, outW, outH);
+    g.fillStyle = 'rgba(0,0,0,0.25)';
+    g.fillRect(0, 0, outW, outH);
+  }
 
   // ------------------------------------------------------------------ crop screen
   function cropper(srcBlob, w, h, startCrop, onDone, onCancel) {
@@ -162,28 +195,30 @@
     ov.id = 'wpCropOv';
     ov.innerHTML =
       '<div class="wpc-top"><button class="wpc-btn" id="wpcCancel" type="button">Cancel</button><div class="wpc-title">Move and zoom</div><button class="wpc-btn pri" id="wpcDone" type="button">Done</button></div>' +
-      '<div class="wpc-stage" id="wpcStage"><div class="wpc-frame" id="wpcFrame"><img id="wpcImg" alt="" draggable="false"></div></div>' +
-      '<div class="wpc-bottom"><div class="wpc-hint">Drag to move. Pinch or use the slider to zoom. The frame is your screen.</div>' +
+      '<div class="wpc-stage" id="wpcStage"><div class="wpc-frame" id="wpcFrame"><canvas id="wpcBg"></canvas><img id="wpcImg" alt="" draggable="false"></div></div>' +
+      '<div class="wpc-bottom"><div class="wpc-hint">Drag to move. Pinch or use the slider to zoom in or out. The frame is your screen.</div>' +
       '<input type="range" id="wpcZoom" min="100" max="500" value="100" aria-label="Zoom"></div>';
     document.body.appendChild(ov);
     document.body.classList.add('noscroll');
 
-    const frame = $('#wpcFrame', ov), img = $('#wpcImg', ov), stage = $('#wpcStage', ov), zoom = $('#wpcZoom', ov);
+    const frame = $('#wpcFrame', ov), img = $('#wpcImg', ov), stage = $('#wpcStage', ov), zoom = $('#wpcZoom', ov), bgc = $('#wpcBg', ov);
     const imgUrl = URL.createObjectURL(srcBlob);
-    let fw = 0, fh = 0, minS = 1, s = 1, x = 0, y = 0, ready = false;
+    // scales: coverS fills the frame, containS shows the whole photo (zoomed out), maxS is the most you can zoom in
+    let fw = 0, fh = 0, coverS = 1, minS = 1, maxS = 5, s = 1, x = 0, y = 0, ready = false;
 
     function clampXY() {
-      x = Math.min(0, Math.max(fw - w * s, x));
-      y = Math.min(0, Math.max(fh - h * s, y));
+      const iw = w * s, ih = h * s;
+      x = iw <= fw ? (fw - iw) / 2 : Math.min(0, Math.max(fw - iw, x));
+      y = ih <= fh ? (fh - ih) / 2 : Math.min(0, Math.max(fh - ih, y));
     }
     function draw() {
       img.style.width = (w * s) + 'px';
       img.style.height = (h * s) + 'px';
       img.style.transform = 'translate(' + x + 'px,' + y + 'px)';
-      zoom.value = String(Math.round(s / minS * 100));
+      zoom.value = String(Math.round(s / coverS * 100));
     }
     function zoomAt(cx, cy, ns) {
-      ns = Math.min(minS * 5, Math.max(minS, ns));
+      ns = Math.min(maxS, Math.max(minS, ns));
       const px = (cx - x) / s, py = (cy - y) / s;
       s = ns; x = cx - px * s; y = cy - py * s;
       clampXY(); draw();
@@ -195,14 +230,22 @@
       if (fw > availW) { fw = availW; fh = fw * aspect; }
       fw = Math.floor(fw); fh = Math.floor(fh);
       frame.style.width = fw + 'px'; frame.style.height = fh + 'px';
-      minS = Math.max(fw / w, fh / h);
-      if (startCrop && !ready) {
-        s = Math.min(minS * 5, Math.max(minS, fw / (startCrop.sw * w)));
-        x = -startCrop.x0 * w * s; y = -startCrop.y0 * h * s;
-      } else if (!ready) {
-        s = minS; x = (fw - w * s) / 2; y = (fh - h * s) / 2;
+      coverS = Math.max(fw / w, fh / h);
+      minS = Math.min(fw / w, fh / h);
+      maxS = coverS * 5;
+      zoom.min = String(Math.max(5, Math.floor(minS / coverS * 100)));
+      zoom.max = '500';
+      if (!ready) {
+        if (startCrop) {
+          s = Math.min(maxS, Math.max(minS, fw / (startCrop.sw * w)));
+          x = -startCrop.x0 * w * s; y = -startCrop.y0 * h * s;
+        } else {
+          s = coverS; x = (fw - w * s) / 2; y = (fh - h * s) / 2;
+        }
+        bgc.width = fw; bgc.height = fh;
+        paintBlurFill(bgc.getContext('2d'), img, w, h, fw, fh);
       } else {
-        s = Math.max(s, minS);
+        s = Math.min(maxS, Math.max(minS, s));
       }
       ready = true;
       clampXY(); draw();
@@ -249,7 +292,7 @@
       const r = frame.getBoundingClientRect();
       zoomAt(e.clientX - r.left, e.clientY - r.top, s * (e.deltaY < 0 ? 1.1 : 1 / 1.1));
     }, { passive: false });
-    zoom.addEventListener('input', () => zoomAt(fw / 2, fh / 2, minS * (+zoom.value) / 100));
+    zoom.addEventListener('input', () => zoomAt(fw / 2, fh / 2, coverS * (+zoom.value) / 100));
 
     function close() {
       URL.revokeObjectURL(imgUrl);
@@ -259,15 +302,14 @@
     $('#wpcCancel', ov).addEventListener('click', () => { close(); onCancel && onCancel(); });
     $('#wpcDone', ov).addEventListener('click', async () => {
       if (!ready) return;
-      const crop = {
-        x0: Math.max(0, Math.min(1, -x / (w * s))), y0: Math.max(0, Math.min(1, -y / (h * s))),
-        sw: Math.min(1, fw / (w * s)), sh: Math.min(1, fh / (h * s))
-      };
-      const outW = Math.min(900, Math.max(300, Math.round(crop.sw * w)));
-      const outH = Math.round(outW * aspect);
-      const c = document.createElement('canvas');
-      c.width = outW; c.height = outH;
-      c.getContext('2d').drawImage(img, crop.x0 * w, crop.y0 * h, crop.sw * w, crop.sh * h, 0, 0, outW, outH);
+      // the visible frame, expressed in photo coordinates (can extend past the photo when zoomed out)
+      const crop = { x0: -x / (w * s), y0: -y / (h * s), sw: fw / (w * s), sh: fh / (h * s) };
+      const outW = 900, outH = Math.round(outW * aspect);
+      const c = smallCanvas(outW, outH);
+      const g = c.getContext('2d');
+      paintBlurFill(g, img, w, h, outW, outH);
+      g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+      g.drawImage(img, x * outW / fw, y * outH / fh, w * s * outW / fw, h * s * outH / fh);
       const view = await toBlob(c, 0.86);
       const bright = brightness(c);
       close();
@@ -277,7 +319,7 @@
 
   // ------------------------------------------------------------------ editor sheet
   async function openEditor(fid) {
-    const f = HW.getFolder(fid);
+    const f = fid === HOME ? { id: HOME, name: 'Home screen', color: '#64748b' } : HW.getFolder(fid);
     if (!f) return;
     let rec = null;
     try { rec = await dbGet(fid); }
