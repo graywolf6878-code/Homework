@@ -6,6 +6,7 @@
   const COLORS = ['#8b5cf6', '#ec4899', '#14b8a6', '#f97316', '#6366f1', '#06b6d4', '#d4a373', '#94a3b8'];
   const CAL = [[10080, '1 week'], [1440, '1 day'], [180, '3 hours'], [60, '1 hour'], [15, '15 min']];
   const MIN = 60000, DAY = 86400000;
+  const EST_PRESETS = [15, 30, 60, 120, 180, 240, 300];
   const CNT_LABEL = { over: 'overdue', red: 'under 24 h', yellow: 'under 2 d', blue: 'under 1 wk', green: 'later' };
 
   const ICON = {
@@ -34,6 +35,48 @@
     return new Date(ms).toLocaleString([], o);
   }
 
+  // time estimates (minutes)
+  function fmtEst(m) {
+    if (m < 60) return m + ' min';
+    const h = Math.floor(m / 60), r = m % 60;
+    return h + ' h' + (r ? ' ' + r + ' min' : '');
+  }
+  function estOptLabel(m) { return m < 60 ? m + ' min' : (m / 60) + (m === 60 ? ' hour' : ' hours'); }
+  function estHtml(p, est) {
+    const preset = EST_PRESETS.indexOf(est) >= 0, custom = est > 0 && !preset;
+    let cv = '', unit = 'h';
+    if (custom) { if (est % 30 === 0) cv = est / 60; else { cv = est; unit = "m"; } }
+    return '<label>Time estimate (optional)<select id="' + p + 'Est">' +
+      '<option value="0">No estimate</option>' +
+      EST_PRESETS.map(m => '<option value="' + m + '"' + (m === est ? ' selected' : '') + '>' + estOptLabel(m) + '</option>').join('') +
+      '<option value="custom"' + (custom ? ' selected' : '') + '>Custom…</option></select></label>' +
+      '<div class="two" id="' + p + 'EstC"' + (custom ? '' : ' hidden') + '>' +
+      '<label>Amount<input id="' + p + 'EstN" type="number" inputmode="decimal" min="0" step="any" value="' + cv + '" placeholder="e.g. 1.5"></label>' +
+      '<label>Unit<select id="' + p + 'EstU"><option value="h"' + (unit === 'h' ? ' selected' : '') + '>hours</option><option value="m"' + (unit === 'm' ? ' selected' : '') + '>minutes</option></select></label></div>';
+  }
+  function bindEst(p) {
+    const sel = $('#' + p + 'Est');
+    sel.addEventListener('change', () => {
+      const c = sel.value === 'custom';
+      $('#' + p + 'EstC').hidden = !c;
+      if (c) $('#' + p + 'EstN').focus();
+    });
+  }
+  function readEst(p) {
+    const v = $('#' + p + 'Est').value;
+    if (v !== 'custom') return +v || 0;
+    const n = parseFloat($('#' + p + 'EstN').value);
+    if (!(n > 0)) return 0;
+    const m = $('#' + p + 'EstU').value === 'h' ? n * 60 : n;
+    return Math.min(5940, Math.max(1, Math.round(m)));
+  }
+  function setEstUI(p, est) {
+    const preset = EST_PRESETS.indexOf(est) >= 0;
+    $('#' + p + 'Est').value = est ? (preset ? String(est) : 'custom') : '0';
+    $('#' + p + 'EstC').hidden = !(est && !preset);
+    $('#' + p + 'EstN').value = '';
+  }
+
   // ------------------------------------------------------------------ urgency (automatic)
   function urg(due, now) {
     const d = due - (now || Date.now());
@@ -55,7 +98,7 @@
   }
 
   // ------------------------------------------------------------------ state
-  function defaultState() { return { v: 2, folders: [], items: [], settings: { opacity: 100, cal: [1440, 60] } }; }
+  function defaultState() { return { v: 2, folders: [], items: [], settings: { opacity: 100, cal: [1440, 60], streak: { on: false, since: 0, best: 0 } } }; }
   let S = defaultState();
   let storageOk = true;
 
@@ -70,12 +113,19 @@
       .map(i => ({
         id: i.id, folderId: i.folderId, title: i.title.slice(0, 200),
         notes: typeof i.notes === 'string' ? i.notes.slice(0, 2000) : '',
-        due: i.due, done: !!i.done, doneAt: Number.isFinite(i.doneAt) ? i.doneAt : 0
+        due: i.due, done: !!i.done, doneAt: Number.isFinite(i.doneAt) ? i.doneAt : 0,
+        est: Number.isFinite(i.est) && i.est > 0 ? Math.min(5940, Math.round(i.est)) : 0
       }));
     const s = d.settings || {};
     const cal = Array.isArray(s.cal) ? s.cal.filter(m => CAL.some(c => c[0] === m)) : [1440, 60];
     const opacity = Number.isFinite(s.opacity) ? Math.min(100, Math.max(30, Math.round(s.opacity))) : 100;
-    return { v: 2, folders, items, settings: { opacity, cal } };
+    const st = s.streak || {};
+    const streak = {
+      on: !!st.on,
+      since: Number.isFinite(st.since) && st.since > 0 ? st.since : 0,
+      best: Number.isFinite(st.best) && st.best > 0 ? Math.floor(st.best) : 0
+    };
+    return { v: 2, folders, items, settings: { opacity, cal, streak } };
   }
   function load() {
     try {
@@ -96,6 +146,89 @@
   const byDue = (a, b) => a.due - b.due || a.title.localeCompare(b.title);
   const openItems = fid => S.items.filter(i => !i.done && (!fid || i.folderId === fid)).sort(byDue);
   const doneItems = fid => S.items.filter(i => i.done && i.folderId === fid).sort((a, b) => b.doneAt - a.doneAt);
+
+  // ------------------------------------------------------------------ weekly workload
+  // Open assignments due within 7 days, plus anything already overdue.
+  function weekWork(now) {
+    const items = S.items.filter(i => !i.done && i.due < now + 7 * DAY).sort(byDue);
+    const total = items.reduce((a, i) => a + (i.est || 0), 0);
+    return { items, total, missing: items.filter(i => !i.est).length };
+  }
+  function openEstBreakdown() {
+    const now = Date.now(), wk = weekWork(now);
+    const row = i => '<div class="brow"><span class="bt">' + esc(i.title) + '</span><span class="be">' + (i.est ? fmtEst(i.est) : '<i>no estimate</i>') + '</span></div>';
+    let byClass = '';
+    S.folders.forEach(f => {
+      const list = wk.items.filter(i => i.folderId === f.id);
+      if (!list.length) return;
+      const t = list.reduce((a, i) => a + (i.est || 0), 0);
+      byClass += '<div class="bgrp"><div class="bhead"><span class="chip" style="--c:' + f.color + '">' + esc(f.name) + '</span><b>' + (t ? fmtEst(t) : '—') + '</b></div>' +
+        list.map(row).join('') + '</div>';
+    });
+    const today = new Date(now); today.setHours(0, 0, 0, 0);
+    const dayStart = ms => { const d = new Date(ms); d.setHours(0, 0, 0, 0); return d.getTime(); };
+    const buckets = [];
+    wk.items.forEach(i => {
+      const k = i.due < now ? -1 : dayStart(i.due);
+      let b = buckets.find(x => x.k === k);
+      if (!b) { b = { k, items: [] }; buckets.push(b); }
+      b.items.push(i);
+    });
+    buckets.sort((a, b) => a.k - b.k);
+    const label = k => {
+      if (k === -1) return 'Overdue';
+      const diff = Math.round((k - today.getTime()) / DAY);
+      if (diff === 0) return 'Today';
+      if (diff === 1) return 'Tomorrow';
+      return new Date(k).toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });
+    };
+    const byDay = buckets.map(b => {
+      const t = b.items.reduce((a, i) => a + (i.est || 0), 0);
+      return '<div class="brow bday"><span class="bt">' + esc(label(b.k)) + ' <small>(' + b.items.length + ')</small></span><span class="be">' + (t ? fmtEst(t) : '—') + '</span></div>';
+    }).join('');
+    openSheet(
+      '<h2>Work due this week</h2>' +
+      '<div class="sub">' + (wk.total ? 'About ' + esc(fmtEst(wk.total)) + ' in total' : 'No estimates yet') + '</div>' +
+      '<div class="note">Open assignments due within the next 7 days, plus anything already overdue.' +
+      (wk.missing ? ' ' + wk.missing + ' of ' + wk.items.length + ' ha' + (wk.missing === 1 ? 's' : 've') + ' no estimate and ' + (wk.missing === 1 ? 'is' : 'are') + ' not counted.' : '') + '</div>' +
+      '<h3>By class</h3>' + (byClass || '<div class="note">Nothing due.</div>') +
+      '<h3>By day</h3>' + (byDay || '<div class="note">Nothing due.</div>') +
+      '<button class="btn ghost wide" type="button" data-close>Close</button>'
+    );
+  }
+
+  // ------------------------------------------------------------------ streak
+  // Counts days since anything was last overdue. since = 0 means "broken right now".
+  function syncStreak() {
+    const st = S.settings.streak;
+    if (!st.on) return;
+    const now = Date.now();
+    const over = S.items.filter(i => !i.done && i.due < now);
+    let changed = false;
+    if (over.length) {
+      if (st.since) {
+        const brk = Math.max(st.since, Math.min.apply(null, over.map(i => i.due)));
+        st.best = Math.max(st.best, Math.floor((brk - st.since) / DAY));
+        st.since = 0; changed = true;
+      }
+    } else if (!st.since) { st.since = now; changed = true; }
+    else {
+      const cur = Math.floor((now - st.since) / DAY);
+      if (cur > st.best) { st.best = cur; changed = true; }
+    }
+    if (changed) save();
+  }
+  const streakNow = () => { const st = S.settings.streak; return st.on && st.since ? Math.floor((Date.now() - st.since) / DAY) : 0; };
+  const streakBest = () => Math.max(S.settings.streak.best, streakNow());
+  const dayWord = n => n + (n === 1 ? ' day' : ' days');
+  function updateStreakLine() {
+    const el = $('#streakLine');
+    if (!el) return;
+    const st = S.settings.streak;
+    if (!st.on) { el.hidden = true; return; }
+    el.hidden = false;
+    el.textContent = st.since ? 'Streak: ' + dayWord(streakNow()) + ' without overdue work' : 'Streak: 0 days · finish overdue work to restart';
+  }
 
   // ------------------------------------------------------------------ undo + toast
   let undoSnap = null, toastTimer = null;
@@ -145,6 +278,7 @@
 
   // ------------------------------------------------------------------ routing
   let route = { name: 'home' };
+  let reorderMode = false;
   function parseHash() {
     const p = location.hash.replace(/^#\/?/, '').split('/');
     if (p[0] === 'all') return { name: 'all' };
@@ -157,6 +291,8 @@
 
   function renderRoute(keepScroll) {
     route = parseHash();
+    syncStreak();
+    if (route.name !== 'home') reorderMode = false;
     if (sheetOpen()) closeSheet();
     const y = window.scrollY;
     if (route.name === 'home') renderHome();
@@ -172,11 +308,21 @@
     }
   }
   function refreshViews() {
+    syncStreak();
     if (route.name === 'folder') {
       if (!getFolder(route.id)) { location.hash = '#/'; return; }
       renderFolderList();
     } else if (route.name === 'all') renderAllList();
-    else renderHomeBody();
+    else {
+      if (reorderMode && S.folders.length < 2) { renderHome(); return; }
+      const has = !!$('[data-act=reorder]');
+      if (!reorderMode && has !== (S.folders.length >= 2)) {
+        // Reorder button should appear/disappear when the number of folders changes
+        if (has) $('[data-act=reorder]').remove();
+        else $('[data-act=settings]').insertAdjacentHTML('beforebegin', '<button class="pillbtn" data-act="reorder">Reorder</button>');
+      }
+      renderHomeBody();
+    }
   }
 
   // ------------------------------------------------------------------ cards
@@ -191,6 +337,7 @@
       '<button class="chk' + (it.done ? ' on' : '') + '" data-act="toggle" aria-label="' + (it.done ? 'Mark not done' : 'Mark done') + '">' + (it.done ? ICON.check : '') + '</button>' +
       '<div class="info"><div class="t">' + esc(it.title) + '</div>' +
       '<div class="m">' + pill + '<span>' + esc(fmtDue(it.due)) + '</span>' +
+      (it.est && !it.done ? '<span class="est">~' + fmtEst(it.est) + '</span>' : '') +
       (showFolder && f ? '<span class="chip" style="--c:' + f.color + '">' + esc(f.name) + '</span>' : '') + '</div>' +
       (it.notes ? '<div class="n">' + esc(it.notes) + '</div>' : '') + '</div>' +
       (it.done ? '<button class="xbtn" data-act="del" aria-label="Delete permanently">✕</button>' : '') +
@@ -199,17 +346,34 @@
 
   // ------------------------------------------------------------------ home
   function renderHome() {
-    app().innerHTML =
-      '<header class="top"><h1><span class="name">Homework</span></h1><button class="pillbtn" data-act="settings">Settings</button></header>' +
-      '<div class="search"><input id="q" type="search" placeholder="Search all assignments" autocomplete="off" enterkeyhint="search"></div>' +
-      '<div id="homeBody"></div>';
-    $('#q').addEventListener('input', renderHomeBody);
+    if (reorderMode && S.folders.length < 2) reorderMode = false;
+    if (reorderMode) {
+      app().innerHTML =
+        '<header class="top"><h1><span class="name">Reorder folders</span></h1><button class="pillbtn" data-act="reorderDone">Done</button></header>' +
+        '<div id="homeBody"></div>';
+    } else {
+      app().innerHTML =
+        '<header class="top"><h1><span class="name">Homework</span></h1>' +
+        (S.folders.length >= 2 ? '<button class="pillbtn" data-act="reorder">Reorder</button>' : '') +
+        '<button class="pillbtn" data-act="settings">Settings</button></header>' +
+        '<div class="streak" id="streakLine" hidden></div>' +
+        '<div class="search"><input id="q" type="search" placeholder="Search all assignments" autocomplete="off" enterkeyhint="search"></div>' +
+        '<div id="homeBody"></div>';
+      $('#q').addEventListener('input', renderHomeBody);
+    }
     renderHomeBody();
   }
 
   function renderHomeBody() {
     const body = $('#homeBody');
-    if (!body) return;
+    if (!body || drag.el) return;
+    if (reorderMode) {
+      body.innerHTML = '<div class="hint">Drag folders to change their order. Tap Done when finished.</div><div class="grid" id="reorderGrid">' +
+        S.folders.map(f => '<button class="tile reorder" style="--fc:' + f.color + '" data-fid="' + f.id + '">' +
+          '<div class="nm">' + esc(f.name) + '</div></button>').join('') + '</div>';
+      return;
+    }
+    updateStreakLine();
     const qEl = $('#q');
     const q = ((qEl && qEl.value) || '').trim().toLowerCase();
     const now = Date.now();
@@ -231,10 +395,13 @@
     const chips = ['over', 'red', 'yellow', 'blue', 'green'].filter(k => counts[k]).map(k =>
       '<span class="cnt u-' + k + '">' + counts[k] + ' ' + CNT_LABEL[k] + '</span>').join('');
 
+    const wk = weekWork(now);
     let html = '<div class="grid">' +
       '<button class="tile all" data-act="openAll"><div class="nm">All assignments</div>' +
       '<div class="sb">' + (open.length ? open.length + ' open' : 'Nothing open') + '</div>' +
-      (chips ? '<div class="cnts">' + chips + '</div>' : '') + '</button>';
+      (chips ? '<div class="cnts">' + chips + '</div>' : '') +
+      (wk.total ? '<span class="estline" role="button" tabindex="0" data-act="estBreakdown">About ' + esc(fmtEst(wk.total)) + ' of work due this week <b>›</b></span>' : '') +
+      '</button>';
 
     S.folders.forEach(f => {
       const list = openItems(f.id);
@@ -278,10 +445,12 @@
       '<form id="addForm" class="formgrid">' +
       '<label>Assignment<input id="aTitle" type="text" required maxlength="200" autocomplete="off" placeholder="e.g. Chapter 4 problem set"></label>' +
       '<div class="two"><label>Due date<input id="aDate" type="date" required></label><label>Time<input id="aTime" type="time" required></label></div>' +
+      estHtml('a', 0) +
       '<label>Notes (optional)<textarea id="aNotes" rows="2" maxlength="2000"></textarea></label>' +
       '<button class="btn" type="submit">Add</button></form></details>' +
       '<div id="listBody"></div>';
     resetAddForm();
+    bindEst('a');
     $('#addForm').addEventListener('submit', onAdd);
     $('#listBody').addEventListener('toggle', e => {
       if (e.target && e.target.id === 'doneBox') doneOpen = e.target.open;
@@ -291,6 +460,7 @@
   function resetAddForm() {
     $('#aTitle').value = ''; $('#aNotes').value = '';
     $('#aDate').value = tomorrowStr(); $('#aTime').value = '23:59';
+    setEstUI('a', 0);
   }
   function onAdd(e) {
     e.preventDefault();
@@ -298,9 +468,10 @@
     const due = parseLocal($('#aDate').value, $('#aTime').value);
     if (!title || !Number.isFinite(due)) return;
     const notes = $('#aNotes').value.trim();
+    const est = readEst('a');
     const fid = route.id;
     mutate('Assignment added', () => {
-      S.items.push({ id: uid(), folderId: fid, title, notes, due, done: false, doneAt: 0 });
+      S.items.push({ id: uid(), folderId: fid, title, notes, due, done: false, doneAt: 0, est });
     });
     resetAddForm();
     $('#addbox').open = false;
@@ -329,27 +500,29 @@
       '<label>Assignment<input id="eTitle" type="text" required maxlength="200" autocomplete="off" value="' + esc(it.title) + '"></label>' +
       '<div class="two"><label>Due date<input id="eDate" type="date" required value="' + ymd(it.due) + '"></label>' +
       '<label>Time<input id="eTime" type="time" required value="' + hm(it.due) + '"></label></div>' +
+      estHtml('e', it.est || 0) +
       '<label>Notes<textarea id="eNotes" rows="3" maxlength="2000">' + esc(it.notes) + '</textarea></label>' +
       '<div class="btns"><button class="btn" type="submit">Save</button><button class="btn sec" type="button" id="eCal">Add to Calendar</button></div>' +
       '<div class="btns"><button class="btn danger" type="button" id="eDel">Delete</button><button class="btn ghost" type="button" data-close>Cancel</button></div>' +
       '</form>',
       () => {
+        bindEst('e');
         const read = () => {
           const title = $('#eTitle').value.trim();
           const due = parseLocal($('#eDate').value, $('#eTime').value);
           if (!title || !Number.isFinite(due)) return null;
-          return { title, due, notes: $('#eNotes').value.trim() };
+          return { title, due, notes: $('#eNotes').value.trim(), est: readEst('e') };
         };
         $('#eForm').addEventListener('submit', e => {
           e.preventDefault();
           const v = read(); if (!v) return;
           closeSheet();
-          mutate('Changes saved', () => { it.title = v.title; it.due = v.due; it.notes = v.notes; });
+          mutate('Changes saved', () => { it.title = v.title; it.due = v.due; it.notes = v.notes; it.est = v.est; });
         });
         $('#eCal').addEventListener('click', () => {
           const v = read();
           if (!v) { $('#eForm').reportValidity(); return; }
-          it.title = v.title; it.due = v.due; it.notes = v.notes;
+          it.title = v.title; it.due = v.due; it.notes = v.notes; it.est = v.est;
           save(); refreshViews();
           exportIcs(it);
         });
@@ -490,6 +663,9 @@
         : '') +
       '<h3>Calendar alerts</h3><div class="note" style="margin-bottom:8px">Used when you tap “Add to Calendar” on an assignment. Alerts fire before the due time.</div>' +
       '<div class="chkrow">' + CAL.map(c => '<label><input type="checkbox" data-cal="' + c[0] + '"' + (S.settings.cal.indexOf(c[0]) >= 0 ? ' checked' : '') + '>' + c[1] + ' before</label>').join('') + '</div>' +
+      '<h3>Streak</h3><div class="note" style="margin-bottom:8px">Counts days in a row without any overdue assignment. It starts counting when you turn it on.</div>' +
+      '<div class="strrow"><label class="chkl"><input type="checkbox" id="stStreak"' + (S.settings.streak.on ? ' checked' : '') + '>Show streak</label>' +
+      '<span class="best" id="stBest">Best: ' + dayWord(streakBest()) + '</span></div>' +
       '<h3>Backup</h3><div class="note">Everything is stored on this phone only. Deleting the app erases it, so back up now and then. Wallpapers are not included in backups.</div>' +
       '<textarea id="bk" rows="4" placeholder="Backup text appears here. To restore, paste a backup here." style="margin-top:10px"></textarea>' +
       '<div class="btns" style="margin-top:10px"><button class="btn sec" type="button" id="bkCopy">Copy backup</button><button class="btn sec" type="button" id="bkRestore">Restore from box</button></div>' +
@@ -501,6 +677,14 @@
           S.settings.opacity = +e.target.value; $('#opVal').textContent = S.settings.opacity + '%'; applySettings();
         });
         $('#opRange').addEventListener('change', save);
+        $('#stStreak').addEventListener('change', e => {
+          const st = S.settings.streak;
+          st.on = e.target.checked;
+          st.since = st.on ? Date.now() : 0;
+          save();
+          $('#stBest').textContent = 'Best: ' + dayWord(streakBest());
+          refreshViews();
+        });
         const homeWp = $('#stHomeWp');
         if (homeWp) homeWp.addEventListener('click', () => { closeSheet(); WP.openEditor('home'); });
         document.querySelectorAll('#sheetBody [data-cal]').forEach(c => c.addEventListener('change', () => {
@@ -539,6 +723,9 @@
     switch (act) {
       case 'back': location.hash = '#/'; break;
       case 'settings': openSettings(); break;
+      case 'reorder': reorderMode = true; renderHome(); window.scrollTo(0, 0); break;
+      case 'estBreakdown': e.stopPropagation(); openEstBreakdown(); break;
+      case 'reorderDone': reorderMode = false; renderHome(); break;
       case 'openAll': go('#/all'); break;
       case 'openFolder': go('#/folder/' + el.dataset.fid); break;
       case 'newFolder': openNewFolder(); break;
@@ -555,6 +742,89 @@
     }
   });
   $('#toastUndo').addEventListener('click', doUndo);
+
+  // ------------------------------------------------------------------ drag to reorder folders
+  const drag = { el: null, ph: null, pid: null, dx: 0, dy: 0, x: 0, y: 0, timer: null };
+
+  function dragPlace() {
+    const el = drag.el;
+    el.style.left = (drag.x - drag.dx) + 'px';
+    el.style.top = (drag.y - drag.dy) + 'px';
+  }
+  function dragHit() {
+    const grid = drag.ph.parentNode;
+    const tiles = grid.querySelectorAll('.tile.reorder');
+    for (const t of tiles) {
+      if (t === drag.el) continue;
+      const r = t.getBoundingClientRect();
+      if (drag.x >= r.left && drag.x <= r.right && drag.y >= r.top && drag.y <= r.bottom) {
+        if (t.compareDocumentPosition(drag.ph) & Node.DOCUMENT_POSITION_FOLLOWING) grid.insertBefore(drag.ph, t);
+        else t.after(drag.ph);
+        return;
+      }
+    }
+  }
+  function dragEnd(cancel) {
+    if (!drag.el) return;
+    clearInterval(drag.timer);
+    const el = drag.el, ph = drag.ph, grid = ph.parentNode;
+    const id = el.dataset.fid;
+    const order = [];
+    if (!cancel) {
+      [...grid.children].forEach(c => { if (c === ph) order.push(id); else if (c !== el && c.dataset.fid) order.push(c.dataset.fid); });
+    }
+    try { el.releasePointerCapture(drag.pid); } catch (e) {}
+    ['position', 'left', 'top', 'width', 'height', 'zIndex'].forEach(p => { el.style[p] = ''; });
+    el.classList.remove('dragging');
+    ph.remove();
+    drag.el = drag.ph = null;
+    const cur = S.folders.map(f => f.id);
+    if (!cancel && order.length === cur.length && order.join() !== cur.join()) {
+      mutate('Folders reordered', () => {
+        const m = {}; S.folders.forEach(f => { m[f.id] = f; });
+        S.folders = order.map(i => m[i]);
+      });
+    } else renderHomeBody();
+  }
+  document.addEventListener('pointerdown', e => {
+    if (!reorderMode || drag.el || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    const t = e.target.closest('.tile.reorder');
+    if (!t) return;
+    e.preventDefault();
+    const r = t.getBoundingClientRect();
+    const ph = document.createElement('div');
+    ph.className = 'tile ph';
+    ph.style.height = r.height + 'px';
+    t.after(ph);
+    drag.el = t; drag.ph = ph; drag.pid = e.pointerId;
+    drag.dx = e.clientX - r.left; drag.dy = e.clientY - r.top;
+    drag.x = e.clientX; drag.y = e.clientY;
+    t.style.position = 'fixed';
+    t.style.width = r.width + 'px';
+    t.style.height = r.height + 'px';
+    t.style.zIndex = '30';
+    t.classList.add('dragging');
+    dragPlace();
+    try { t.setPointerCapture(e.pointerId); } catch (err) {}
+    drag.timer = setInterval(() => {
+      if (!drag.el) return;
+      const edge = 90, h = window.innerHeight;
+      let dy = 0;
+      if (drag.y < edge) dy = -Math.ceil((edge - drag.y) / 6);
+      else if (drag.y > h - edge) dy = Math.ceil((drag.y - (h - edge)) / 6);
+      if (dy) { window.scrollBy(0, dy); dragHit(); }
+    }, 16);
+  });
+  document.addEventListener('pointermove', e => {
+    if (!drag.el || e.pointerId !== drag.pid) return;
+    e.preventDefault();
+    drag.x = e.clientX; drag.y = e.clientY;
+    dragPlace();
+    dragHit();
+  }, { passive: false });
+  document.addEventListener('pointerup', e => { if (drag.el && e.pointerId === drag.pid) dragEnd(false); });
+  document.addEventListener('pointercancel', e => { if (drag.el && e.pointerId === drag.pid) dragEnd(true); });
+
   window.addEventListener('hashchange', () => renderRoute());
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && sheetOpen()) closeSheet(); });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshViews(); });
